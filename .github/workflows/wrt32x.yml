@@ -1,4 +1,7 @@
 #
+# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
+# Updated for 2026 compatibility & Tailscale Direct Tunnel
+# Description: Build OpenWrt for Linksys WRT32X
 #
 
 name: wrt32x
@@ -8,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       ssh:
-        description: 'SSH connection to Actions (true 开启云端 Upterm 交互)'
+        description: 'SSH connection to Actions (true 开启云端 Tailscale 直连)'
         required: false
         default: 'false'
       branchchose:
@@ -85,9 +88,49 @@ jobs:
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
 
-    - name: SSH connection to Actions
-      uses: lhotari/action-upterm@v1
+    # ==================== TAILSCALE 核心组网模块 ====================
+    - name: Setup Password SSH & Connect to Tailscale
       if: (inputs.ssh == 'true' && inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+      env:
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      run: |
+        # 1. 强制重设云端虚拟机密码，并开启原生的 SSH 密码登录鉴权
+        echo "runner:openwrt" | sudo chpasswd
+        sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+        sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+        sudo systemctl restart ssh 2>/dev/null || sudo systemctl restart sshd
+        
+        # 2. 一键安全下载并拉起 Tailscale 节点
+        curl -fsSL https://tailscale.com/install.sh | sh
+        sudo tailscale up --authkey=${TAILSCALE_AUTH_KEY} --hostname=github-wrt32x-runner
+        
+        # 3. 打印核心审计对账数据，供本地直连
+        echo "=========================================================="
+        echo "✅ GitHub Runner 已成功加入你的 Tailscale 私有内网！"
+        echo "📌 机器内网 IP 为: $(tailscale ip -4)"
+        echo "👤 SSH 用户名: runner"
+        echo "🔑 SSH 密  码: openwrt"
+        echo "=========================================================="
+        echo "💡 傻瓜式操作指引："
+        echo "1. 复制上方打印的内网 IP。"
+        echo "2. 打开本地 Win10 的 Git Bash 或免安装的 PuTTY 连接该 IP。"
+        echo "3. 输入用户名 runner 和密码 openwrt 登入云端系统。"
+        echo "4. 登入后执行：cd openwrt && make menuconfig 进入菜单配置。"
+        echo "5. 配置完成后保存退出，在终端执行：touch /tmp/continue 即可放行编译。"
+        echo "=========================================================="
+        
+        # 4. 挂起工作流，直到本地发出放行信号
+        touch /tmp/block
+        while [ -f /tmp/block ]; do
+          if [ -f /tmp/continue ]; then
+            rm -f /tmp/block
+          fi
+          sleep 5
+        done
+        
+        # 5. 编译恢复前主动断开内网，确保安全隔離
+        sudo tailscale logout
+    # ================================================================
 
     - name: Download package
       id: package
