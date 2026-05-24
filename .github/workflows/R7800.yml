@@ -1,6 +1,6 @@
 #
 # Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
-# Updated for 2026 compatibility, NSS Optimization & Tailscale Direct Tunnel
+# Updated for 2026: Node 24 Action tags, Tailscale Timeout Protection, NSS Core
 # Description: Build OpenWrt for Netgear R7800
 #
 
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       ssh:
-        description: 'SSH connection to Actions (填 true 开启云端 Tailscale 直连调试)'
+        description: 'SSH connection to Actions (填 true 开启 Tailscale 直连)'
         required: false
         default: 'false'
       branchchose:
@@ -32,8 +32,6 @@ env:
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
-  # 彻底阻断 Node.js 20 弃用带来的流水线变黄或中断报错
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -52,7 +50,7 @@ jobs:
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -qq update
-        # 抛弃失效的 git.io 依赖，换用物理全量手写依赖链，保证 100% 构筑成功
+        # 最完整的 ubuntu-22.04 核心依赖包，摒弃一切外部废弃脚本
         sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build psmisc qemu-utils rsync srecord bc subversion swig texinfo u-boot-tools upx-ucl unzip vim wget xmlto xz-utils zlib1g-dev
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
@@ -91,7 +89,7 @@ jobs:
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
 
-    # ==================== 🛠️ TAILSCALE 云端内网直连调试架构 ====================
+    # ==================== 🛠️ TAILSCALE 智能熔断调试架构 ====================
     - name: Setup Password SSH & Connect to Tailscale
       if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh != 'false') || contains(github.event.action, 'ssh')
       env:
@@ -107,18 +105,28 @@ jobs:
         
         echo "=========================================================="
         echo "✅ R7800 编译节点已成功加入你的 Tailscale 私有网络！"
-        echo "📌 内网 IP 目标: $(tailscale ip -4)"
+        echo "📌 目标 IP: $(tailscale ip -4)"
         echo "👤 账号: runner | 🔑 密码: openwrt"
-        echo "🚀 菜单调整完毕后，在终端敲入: touch /tmp/continue 即可恢复自动化编译"
+        echo "🚀 放行命令: touch /tmp/continue"
+        echo "⏳ 倒计时: 60分钟后若无操作，流水线将自动熔断执行，以保护账号资源"
         echo "=========================================================="
         
         touch /tmp/block
-        while [ -f /tmp/block ]; do
+        MAX_WAIT=3600
+        WAIT_TIME=0
+        while [ -f /tmp/block ] && [ $WAIT_TIME -lt $MAX_WAIT ]; do
           if [ -f /tmp/continue ]; then
             rm -f /tmp/block
+            echo "🚀 接收到放行指令，准备开始编译..."
           fi
           sleep 5
+          WAIT_TIME=$((WAIT_TIME+5))
         done
+        
+        if [ -f /tmp/block ]; then
+          echo "⚠️ 60分钟超时！未收到放行指令，系统触发自动熔断，继续强行编译以防资源死锁。"
+        fi
+        
         sudo tailscale logout
     # =========================================================================
 
@@ -135,7 +143,6 @@ jobs:
       id: compile
       run: |
         cd openwrt
-        # 彻底清除了老旧过时的 CodeAurora 源码树正则替换补丁，减少流水线风险
         echo -e "$(nproc) thread compile"
         make -j$(nproc) || make -j2 || make -j2 V=s
         echo "status=success" >> $GITHUB_OUTPUT
