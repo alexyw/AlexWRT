@@ -1,11 +1,7 @@
 #
 # Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-# Description: Build OpenWrt using GitHub Actions
+# Updated for 2026: Node 24 Action tags, Tailscale Timeout Protection, x86 BBR Base
+# Description: Build OpenWrt for x86_64
 #
 
 name: x86_64
@@ -15,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       ssh:
-        description: 'SSH connection to Actions'
+        description: 'SSH connection to Actions (填 true 开启 Tailscale 直连调试)'
         required: false
         default: 'false'
       branchchose:
@@ -36,17 +32,18 @@ env:
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     permissions:
       contents: write
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Initialization environment
       env:
@@ -54,7 +51,8 @@ jobs:
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -qq update
-        sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2004)
+        # 物理全量手写依赖，彻底摒弃失效的 git.io 在线拉取
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build psmisc qemu-utils rsync srecord bc subversion swig texinfo u-boot-tools upx-ucl unzip vim wget xmlto xz-utils zlib1g-dev
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
@@ -82,7 +80,7 @@ jobs:
       run: |
         cd openwrt
         ./scripts/feeds install -a 
-        sed -i '/bench/d' feeds/luci/modules/luci-mod-admin-full/luasrc/view/admin_status/index.htm
+        sed -i '/bench/d' feeds/luci/modules/luci-mod-admin-full/luasrc/view/admin_status/index.htm || true
 
     - name: Load custom configuration
       run: |
@@ -92,12 +90,46 @@ jobs:
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
 
-    - name: SSH connection to Actions
-      uses: P3TERX/ssh2actions@main
-      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+    # ==================== 🛠️ TAILSCALE 智能熔断调试架构 ====================
+    - name: Setup Password SSH & Connect to Tailscale
+      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh != 'false') || contains(github.event.action, 'ssh')
       env:
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      run: |
+        echo "runner:openwrt" | sudo chpasswd
+        sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+        sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+        sudo systemctl restart ssh 2>/dev/null || sudo systemctl restart sshd
+        
+        curl -fsSL https://tailscale.com/install.sh | sh
+        sudo tailscale up --authkey=${TAILSCALE_AUTH_KEY} --hostname=github-x86-runner
+        
+        echo "=========================================================="
+        echo "✅ x86_64 编译节点已成功加入你的 Tailscale 私有网络！"
+        echo "📌 目标 IP: $(tailscale ip -4)"
+        echo "👤 账号: runner | 🔑 密码: openwrt"
+        echo "🚀 放行命令: touch /tmp/continue"
+        echo "⏳ 倒计时: 60分钟后若无操作，流水线将自动熔断执行，以保护账号资源"
+        echo "=========================================================="
+        
+        touch /tmp/block
+        MAX_WAIT=3600
+        WAIT_TIME=0
+        while [ -f /tmp/block ] && [ $WAIT_TIME -lt $MAX_WAIT ]; do
+          if [ -f /tmp/continue ]; then
+            rm -f /tmp/block
+            echo "🚀 接收到放行指令，准备开始编译..."
+          fi
+          sleep 5
+          WAIT_TIME=$((WAIT_TIME+5))
+        done
+        
+        if [ -f /tmp/block ]; then
+          echo "⚠️ 60分钟超时！未收到放行指令，系统触发自动熔断，继续强行编译以防资源死锁。"
+        fi
+        
+        sudo tailscale logout
+    # =========================================================================
 
     - name: Download package
       id: package
@@ -123,27 +155,14 @@ jobs:
       if: (!cancelled())
       run: df -hT
 
-    - name: Upload bin directory
-      uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
-
     - name: Organize files
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
         cd openwrt/bin/targets/*/*
+        cp $GITHUB_WORKSPACE/openwrt/.config ./final_x86_64.config
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
-
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@main
-      if: steps.organize.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
 
     - name: Generate release tag
       id: tag
@@ -154,7 +173,7 @@ jobs:
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Upload firmware to release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       if: steps.tag.outputs.status == 'success' && !cancelled()
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -164,13 +183,13 @@ jobs:
         files: ${{ env.FIRMWARE }}/*
 
     - name: Delete workflow runs
-      uses: Mattraks/delete-workflow-runs@main
+      uses: Mattraks/delete-workflow-runs@v2
       with:
         retain_days: 1
         keep_minimum_runs: 1
 
     - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@v0.2.1
+      uses: dev-drprasad/delete-older-releases@v0.3.3
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
       with:
         keep_latest: 6
